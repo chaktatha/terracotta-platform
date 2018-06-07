@@ -50,6 +50,11 @@ public class MyPlatformConfiguration implements PlatformConfiguration {
   public <T> Collection<T> getExtendedConfiguration(Class<T> aClass) {
     return null;
   }
+
+  @Override
+  public <T> T getDynamicConfiguration(final Class<T> type) {
+    return null;
+  }
 }
 
 

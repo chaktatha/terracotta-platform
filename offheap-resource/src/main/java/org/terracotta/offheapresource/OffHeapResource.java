@@ -59,4 +59,12 @@ public interface OffHeapResource {
    * @return the resource initial capacity
    */
   long capacity();
+
+  /**
+   * Alter the capacity of this pool to a new value. New value must be more than the existing value
+   *
+   * @param size new pool size
+   * @throws IllegalArgumentException if the capacity increase is negative
+   */
+  void alterCapacity(long size) throws IllegalArgumentException;
 }

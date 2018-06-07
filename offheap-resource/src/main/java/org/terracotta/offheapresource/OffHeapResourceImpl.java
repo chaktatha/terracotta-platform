@@ -22,8 +22,7 @@ import org.terracotta.offheapresource.management.OffHeapResourceBinding;
 import java.io.IOException;
 import java.io.InputStream;
 import java.util.Properties;
-import java.util.concurrent.atomic.AtomicInteger;
-import java.util.concurrent.atomic.AtomicLong;
+import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.BiConsumer;
 
 /**
@@ -61,12 +60,11 @@ class OffHeapResourceImpl implements OffHeapResource {
     }
   }
 
-  private final AtomicLong remaining;
-  private final long capacity;
   private final String identifier;
   private final BiConsumer<OffHeapResourceImpl, ThresholdChange> onReservationThresholdReached;
   private final OffHeapResourceBinding managementBinding;
-  private final AtomicInteger threshold = new AtomicInteger();
+
+  private final AtomicReference<OffHeapStorageCapacity> storageCapacityRef;
 
   /**
    * Creates a resource of the given initial size.
@@ -82,8 +80,7 @@ class OffHeapResourceImpl implements OffHeapResource {
     if (size < 0) {
       throw new IllegalArgumentException("Resource size cannot be negative");
     } else {
-      this.capacity = size;
-      this.remaining = new AtomicLong(size);
+      this.storageCapacityRef = new AtomicReference<>(new OffHeapStorageCapacity(size));
       this.identifier = identifier;
     }
   }
@@ -104,44 +101,29 @@ class OffHeapResourceImpl implements OffHeapResource {
   public boolean reserve(long size) throws IllegalArgumentException {
     if (size < 0) {
       throw new IllegalArgumentException("Reservation size cannot be negative");
-    } else {
-      for (long current = remaining.get(); current >= size; current = remaining.get()) {
-        if (remaining.compareAndSet(current, current - size)) {
-          remainingUpdated(current - size);
+    }
+    while(true) {
+      OffHeapStorageCapacity currentCapacityStore = this.storageCapacityRef.get();
+      long remaining = currentCapacityStore.remaining;
+      if (remaining >= size) {
+        long currentCapacity = currentCapacityStore.capacity;
+        OffHeapStorageCapacity newCapacityStore = new OffHeapStorageCapacity(currentCapacity, (remaining - size));
+        if (this.storageCapacityRef.compareAndSet(currentCapacityStore, newCapacityStore)){
+          int newThreshold = newCapacityStore.threshold;
+          onReservationThresholdReached.accept(this, new ThresholdChange(currentCapacityStore.threshold, newThreshold));
+          if (newThreshold == 90) {
+            LOGGER.warn(MESSAGE_PROPERTIES.getProperty(OFFHEAP_WARN_KEY), identifier, newCapacityStore.percentOccupied);
+          } else {
+            LOGGER.info(MESSAGE_PROPERTIES.getProperty(OFFHEAP_INFO_KEY), identifier, newCapacityStore.percentOccupied);
+          }
           return true;
         }
+      } else {
+        break;
       }
-      return false;
     }
-  }
+    return false;
 
-  private void remainingUpdated(long remaining) {
-    long percentOccupied = (capacity - remaining) * 100 / capacity;
-    int newT, curT = threshold.get();
-    if (percentOccupied >= 90) {
-      newT = 90;
-    } else if (percentOccupied >= 75) {
-      newT = 75;
-    } else {
-      newT = 0;
-    }
-    if (threshold.compareAndSet(curT, newT)) {
-      if (newT > curT) {
-        // increase from 0->75 or 75->90
-        if (newT == 90) {
-          LOGGER.warn(MESSAGE_PROPERTIES.getProperty(OFFHEAP_WARN_KEY), identifier, percentOccupied);
-        } else {
-          LOGGER.info(MESSAGE_PROPERTIES.getProperty(OFFHEAP_INFO_KEY), identifier, percentOccupied);
-        }
-        onReservationThresholdReached.accept(this, new ThresholdChange(curT, newT));
-      } else if (newT < curT) {
-        // decrease from 90->75 or 75->0
-        if (newT == 75) {
-          LOGGER.info(MESSAGE_PROPERTIES.getProperty(OFFHEAP_INFO_KEY), identifier, percentOccupied);
-        }
-        onReservationThresholdReached.accept(this, new ThresholdChange(curT, newT));
-      }
-    }
   }
 
   /**
@@ -151,10 +133,24 @@ class OffHeapResourceImpl implements OffHeapResource {
   @Override
   public void release(long size) throws IllegalArgumentException {
     if (size < 0) {
-      throw new IllegalArgumentException("Released size cannot be negative");
-    } else {
-      long remaining = this.remaining.addAndGet(size);
-      remainingUpdated(remaining);
+      throw new IllegalArgumentException("Reservation size cannot be negative");
+    }
+    while(true) {
+      OffHeapStorageCapacity currentCapacityStore = this.storageCapacityRef.get();
+      long remaining = currentCapacityStore.remaining;
+      long currentCapacity = currentCapacityStore.capacity;
+      if (remaining + size < currentCapacity) {
+        OffHeapStorageCapacity newCapacityStore = new OffHeapStorageCapacity(currentCapacity, (remaining + size));
+        if (this.storageCapacityRef.compareAndSet(currentCapacityStore, newCapacityStore)){
+          int newThreshold = newCapacityStore.threshold;
+          onReservationThresholdReached.accept(this, new ThresholdChange(currentCapacityStore.threshold, newThreshold));
+          if (newThreshold == 75) {
+            LOGGER.info(MESSAGE_PROPERTIES.getProperty(OFFHEAP_INFO_KEY), identifier, newCapacityStore.percentOccupied);
+          }
+        }
+      } else {
+        break;
+      }
     }
   }
 
@@ -163,14 +159,42 @@ class OffHeapResourceImpl implements OffHeapResource {
    */
   @Override
   public long available() {
-    return remaining.get();
+    return this.storageCapacityRef.get().remaining;
   }
 
   @Override
   public long capacity() {
-    return capacity;
+    return this.storageCapacityRef.get().capacity;
   }
-  
+
+  @Override
+  public void alterCapacity(final long size) throws IllegalArgumentException {
+    if (size < 0) {
+      throw new IllegalArgumentException("Capacity increase size cannot be negative");
+    }
+    while (true) {
+      OffHeapStorageCapacity currentCapacityStore = this.storageCapacityRef.get();
+      long currentCapacity = currentCapacityStore.capacity;
+      long currentRemainingCapacity = currentCapacityStore.remaining;
+      if(currentCapacity == size) {
+        break;
+      }
+      if (currentCapacity > size) {
+        throw new IllegalArgumentException("Desired new capacity "+size+" is less than the current capacity of "+currentCapacity);
+      }
+      long newRemainingCapacity = currentRemainingCapacity + (size - currentCapacity);
+      OffHeapStorageCapacity newCapacity = new OffHeapStorageCapacity(size, newRemainingCapacity);
+      if(this.storageCapacityRef.compareAndSet(currentCapacityStore, newCapacity)){
+        int newThreshold = newCapacity.threshold;
+        onReservationThresholdReached.accept(this, new ThresholdChange(currentCapacityStore.threshold, newThreshold));
+        if (newThreshold == 75) {
+          LOGGER.info(MESSAGE_PROPERTIES.getProperty(OFFHEAP_INFO_KEY), identifier, newCapacity.percentOccupied);
+        }
+        break;
+      }
+    }
+  }
+
   static class ThresholdChange {
     final int old;
     final int now;
@@ -179,5 +203,60 @@ class OffHeapResourceImpl implements OffHeapResource {
       this.old = old;
       this.now = now;
     }
+  }
+
+  static final class OffHeapStorageCapacity {
+    private final long capacity;
+    private final long remaining;
+    private final int threshold;
+    private final long percentOccupied;
+
+    OffHeapStorageCapacity(long capacity){
+      this.capacity = capacity;
+      this.remaining = capacity;
+      long percentOccupied;
+      if (capacity == 0) {
+        percentOccupied = 100L;
+      } else {
+        percentOccupied = (this.capacity - this.remaining)*100/capacity;
+      }
+      int newT;
+      if (percentOccupied == 100) {
+        newT = 100;
+      } else if (percentOccupied >= 90) {
+        newT = 90;
+      } else if (percentOccupied >= 75) {
+        newT = 75;
+      } else {
+        newT = 0;
+      }
+      this.percentOccupied = percentOccupied;
+      this.threshold = newT;
+    }
+
+    OffHeapStorageCapacity(long capacity, long remaining){
+      this.capacity = capacity;
+      this.remaining = remaining;
+      long percentOccupied;
+      if (capacity == 0) {
+        percentOccupied = 100L;
+      } else {
+        percentOccupied = (this.capacity - this.remaining)*100/capacity;
+      }
+
+      int newT;
+      if (percentOccupied == 100) {
+        newT = 100;
+      } else if (percentOccupied >= 90) {
+        newT = 90;
+      } else if (percentOccupied >= 75) {
+        newT = 75;
+      } else {
+        newT = 0;
+      }
+      this.percentOccupied = percentOccupied;
+      this.threshold = newT;
+    }
+
   }
 }
